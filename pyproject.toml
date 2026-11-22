@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uninstallerx"
+version = "0.1.0"
+description = "Synthetic Windows software removal agent and security evaluation harness"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+uninstallerx = "uninstallerx.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

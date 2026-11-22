@@ -1,0 +1,25 @@
+{
+  "status": "pilot_candidate",
+  "model": {
+    "repository": "ibm-granite/granite-4.2-3b-GGUF",
+    "revision": "c40945d71cd90f249a56985e8155551a9188dc30",
+    "file": "granite-4.2-3b-Q4_K_M.gguf",
+    "size_bytes": 2244011552,
+    "sha256": "e0406663965846ae22a403456eb826ccce5f450840491f71952f18a7cb78e7d5"
+  },
+  "runtime": {
+    "repository": "ggml-org/llama.cpp",
+    "release": "b12414",
+    "archive": "llama-b12414-bin-win-cpu-x64.zip",
+    "sha256": "bbd666b4fe357053f4105b69b815a26f8223cfdbf7b2b4a9042b2fee979575a3"
+  },
+  "serving": {
+    "host": "127.0.0.1",
+    "port": 18089,
+    "context_tokens": 4096,
+    "threads": 4,
+    "parallel_requests": 1,
+    "minimum_free_ram_gib": 8,
+    "reasoning": "off"
+  }
+}
