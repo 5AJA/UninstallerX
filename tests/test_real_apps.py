@@ -42,7 +42,7 @@ from uninstallerx.vendor_process import VendorRun
 from uninstallerx.windows import system_directory
 from uninstallerx.packaged_apps import PackageApp
 from uninstallerx.portable_apps import PortableApp, read_portable_executables
-from uninstallerx.portable_files import BACKUP_SEMANTICS, INVALID_HANDLE, OPEN_EXISTING, _kernel, delete_verified, fingerprint, rename_sibling_verified
+from uninstallerx.portable_files import BACKUP_SEMANTICS, INVALID_HANDLE, OPEN_EXISTING, _kernel, fingerprint, move_verified
 
 
 class RealAppTests(unittest.TestCase):
@@ -149,7 +149,7 @@ class RealAppTests(unittest.TestCase):
             model = self.model("desktop", "inspect_c1", "propose_c1", "list_search_locations", "stop")
             result = run_real(self.root, model, self.app.name, apply=False, closing=Event(), review=review, progress=Mock())
         self.assertEqual(result["status"], "preview")
-        self.assertEqual(result["residual_deleted_count"], 0)
+        self.assertEqual(result["residual_quarantined_count"], 0)
         execute.assert_not_called()
         review.assert_not_called()
         packages.assert_called_once_with()
@@ -249,15 +249,14 @@ class RealAppTests(unittest.TestCase):
                                select_observed_file, "read_d1", "stop")
             result = run_real(self.root, model, self.app.name, apply=True, closing=Event(), review=review, progress=Mock())
         self.assertEqual(result["status"], "removed")
-        self.assertEqual(result["residual_deleted_count"], 1)
+        self.assertEqual(result["residual_quarantined_count"], 1)
         self.assertEqual(review.call_count, 2)
         self.assertEqual(review.call_args.args[1][0][1], str(cache))
         self.assertFalse(cache.exists())
         self.assertEqual(other_cache.read_text(), "not proposed")
         self.assertEqual(profile.read_text(), "user data")
         self.assertEqual(profile.read_text(), "user data")
-        self.assertFalse((self.root / ".local" / "quarantine").exists())
-        self.assertFalse(result["recovery_available"])
+        self.assertTrue(result["recovery_available"])
         events = [json.loads(line) for line in Path(result["audit_path"]).read_text(encoding="utf-8").splitlines()]
         phase = [event["event"] for event in events if event.get("phase") == "residuals"]
         self.assertLess(phase.index("model_read_requested"), phase.index("read_observation"))
@@ -388,10 +387,10 @@ class RealAppTests(unittest.TestCase):
                     review.assert_called_once()
                 else:
                     self.assertEqual(result["status"], "removed", result)
-                    self.assertEqual(result["residual_deleted_count"], 1)
+                    self.assertEqual(result["residual_quarantined_count"], 1)
                     self.assertFalse(leftover.exists())
                     self.assertEqual(review.call_count, 2)
-                    self.assertLess(names.index("uninstaller_exited"), names.index("residual_delete_approved"))
+                    self.assertLess(names.index("uninstaller_exited"), names.index("residual_quarantine_approved"))
                 if launch == "grandchild":
                     self.assertIn("uninstaller_waiting_for_children", names)
                     total = next(event["total_processes"] for event in events if event["event"] == "uninstaller_exited")
@@ -651,8 +650,55 @@ class RealAppTests(unittest.TestCase):
         with (patch("uninstallerx.real_apps._app_location", return_value=True),
               patch("uninstallerx.real_apps._binary_info", side_effect=lambda path: BinaryInfo(
                   "Arbor Tools", "Inno Setup" if path == uninstaller else "Arbor Editor", str(path)))):
-            with self.assertRaisesRegex(ValueError, "one independently signed"):
-                prepare_uninstall(app)
+            plan = prepare_uninstall(app)
+        self.assertIn("No independently signed app executable", plan.warning)
+        self.assertEqual((plan.primary, plan.publisher), (None, ""))
+
+    def test_unsigned_uninstaller_needs_its_own_approval_and_stays_inside_the_app_folder(self):
+        root, other = self.root / "Arbor Editor", self.root / "Other"
+        root.mkdir()
+        other.mkdir()
+        uninstaller = root / "Uninstall.exe"
+        uninstaller.touch()
+        app = replace(self.app, values={**self.app.values, "InstallLocation": str(root),
+                                        "UninstallString": f'"{uninstaller}"'})
+        live = app
+        titles = []
+
+        def approve(title, rows, note):
+            titles.append(title)
+            self.assertIn("no valid publisher signature", dict(rows)["Not verified"])
+            return True
+
+        def execute(command, **kwargs):
+            nonlocal live
+            live = None
+            uninstaller.unlink()
+            return VendorRun(1)
+
+        with (patch("uninstallerx.real_apps._app_location", return_value=True),
+              patch("uninstallerx.real_apps._binary_info", return_value=BinaryInfo("", ""))):
+            plan = prepare_uninstall(app)
+            self.assertEqual((plan.primary, plan.publisher, plan.product), (None, "", app.name))
+            separate = replace(app, values={**app.values, "InstallLocation": str(other)})
+            with (patch("uninstallerx.real_apps._program_dirs", return_value=[self.root]),
+                  self.assertRaisesRegex(ValueError, "needs a verified signature")):
+                prepare_uninstall(separate)
+            with (patch("uninstallerx.real_apps.installed_apps", return_value=[app]),
+                  patch("uninstallerx.real_apps.search_areas", return_value=[]),
+                  patch("uninstallerx.real_apps._read_installation", side_effect=lambda *_: live),
+                  patch("uninstallerx.real_apps.investigate_settings", return_value=([], False)),
+                  patch("uninstallerx.real_apps.run_vendor", side_effect=execute),
+                  patch.object(ResidualDiscovery, "run", return_value=([], [], False))):
+                model = self.model("inventory", "propose_c1", scripted_discovery=True)
+                report = run_real(self.root, model, app.name, apply=True, closing=Event(), review=approve, progress=Mock())
+        self.assertEqual(report["status"], "removed", report)
+        self.assertEqual(titles, [f"Run the unverified uninstaller for {app.name}?"])
+        self.assertEqual(report["verification_warning"], plan.warning)
+        self.assertNotIn("exit code", report["message"])
+        events = [json.loads(line) for line in Path(report["audit_path"]).read_text(encoding="utf-8").splitlines()]
+        decision = next(event for event in events if event["event"] == "gate_decision" and event["phase"] == "discovery")
+        self.assertEqual((decision["decision"], decision["reason"]), ("approval_required", plan.warning))
 
     def test_win32_passes_approved_vendor_arguments_and_blocks_changed_arguments(self):
         folder = self.root / "Arbor Editor"
@@ -789,6 +835,26 @@ class RealAppTests(unittest.TestCase):
         self.assertEqual(result["portable_files"], [str(executable)])
         self.assertTrue(other.is_file())
 
+    def test_portable_folder_located_by_its_executable_keeps_the_backup_beside_it(self):
+        folder = self.root / "tools" / "Cedar Workspace"
+        folder.mkdir(parents=True)
+        executable, manual = folder / "Cedar.exe", folder / "readme.txt"
+        shutil.copyfile(sys.executable, executable)
+        manual.write_text("package document")
+        model = self.model("desktop", "packages", "scan_p1", "inspect_c1", "distribution_c1", "propose_c1",
+                           {"target_ids": ["D1"]}, "list_search_locations", "stop", scripted_discovery=True)
+        with (patch("uninstallerx.real_apps.installed_apps", return_value=[]),
+              patch("uninstallerx.real_apps.residual_search_roots", return_value=[])):
+            result = run_real(self.root, model, "Cedar", apply=True, closing=Event(), review=Mock(return_value=True),
+                              progress=Mock(), portable_location=executable)
+        self.assertEqual(result["status"], "removed", result)
+        self.assertFalse(folder.exists())
+        self.assertTrue((folder.parent / ".uninstallerx-recovery" / result["job_id"]).is_dir())
+        restored = RecoveryJournal(self.root, result["job_id"]).restore(Mock(return_value=True), Event())
+        self.assertEqual((restored["restored"], restored["skipped"]), (1, 0), restored)
+        self.assertEqual(manual.read_text(), "package document")
+        self.assertTrue(executable.is_file())
+
     def test_existing_recovery_file_preserves_authentication_and_conflict_checks(self):
         source = self.root / "original"
         source.mkdir()
@@ -797,9 +863,7 @@ class RealAppTests(unittest.TestCase):
         cache.write_text("residual")
         other_cache.write_text("unrelated")
         journal = RecoveryJournal(self.root, "windows-" + uuid4().hex[:12])
-        destination = self.root / ".local" / "quarantine" / journal.job_id
-        destination.mkdir(parents=True)
-        backup = destination / cache.name
+        backup = journal.backup_path(self.root)
         journal.record_file(cache, backup, self.root)
         cache.rename(backup)
         expected_mtime = backup.stat().st_mtime_ns
@@ -944,14 +1008,16 @@ class RealAppTests(unittest.TestCase):
         ):
             result = run_real(self.root, model, self.app.name, apply=True, closing=Event(), review=review, progress=Mock())
         self.assertEqual(result["status"], "removed")
-        self.assertEqual(result["residual_deleted_count"], 1, result)
+        self.assertEqual(result["residual_quarantined_count"], 1, result)
         self.assertEqual(result["cache_files"], [str(payload)])
         self.assertIn(str(temp), result["residual_search_roots"])
-        self.assertEqual(review.call_args.args[1], [("Permanently delete file", str(payload))])
+        self.assertEqual(review.call_args.args[1], [("Move file", str(payload))])
         self.assertFalse(payload.exists())
         self.assertTrue(unrelated.is_file())
-        self.assertFalse(result["recovery_available"])
-        self.assertFalse((self.root / ".local" / "quarantine").exists())
+        self.assertTrue(result["recovery_available"])
+        restored = RecoveryJournal(self.root, result["job_id"]).restore(Mock(return_value=True), Event())
+        self.assertEqual((restored["restored"], restored["skipped"]), (1, 0), restored)
+        self.assertEqual(payload.read_text(), "Arbor Tools uninstaller:\nremoving Arbor Editor")
 
     def test_residual_search_continues_after_an_entry_access_error(self):
         from uninstallerx.real_apps import _drive_path
@@ -1471,7 +1537,7 @@ class RealAppTests(unittest.TestCase):
         self.assertNotIn("target_ids", str(failure.exception))
         self.assertEqual(model.complete_json.call_count, 2)
 
-    def test_verified_uninstall_reports_incomplete_when_residual_investigation_stops(self):
+    def test_verified_uninstall_stays_removed_when_residual_investigation_stops(self):
         command = (str(self.root / "vendor" / "uninstall.exe"),)
         plan = RemovalPlan(self.app, command, "digest", self.app.name, self.app.publisher,
                            self.root / "vendor", self.root / "vendor" / "editor.exe", "verified")
@@ -1488,8 +1554,9 @@ class RealAppTests(unittest.TestCase):
             report = run_real(self.root, model, self.app.name, apply=True, closing=Event(),
                               review=Mock(return_value=True), progress=Mock())
         self.assertTrue(report["uninstaller_verified"])
-        self.assertEqual(report["status"], "incomplete_cleanup")
-        self.assertEqual(report["copies"][0]["status"], "incomplete_cleanup")
+        self.assertEqual(report["status"], "removed")
+        self.assertEqual(report["copies"][0]["status"], "removed")
+        self.assertTrue(report["investigation_incomplete"])
         self.assertIn("unreadable test location", report["message"])
 
     def test_multiple_copy_summary_counts_verified_uninstall_with_pending_cleanup(self):
@@ -1513,7 +1580,7 @@ class RealAppTests(unittest.TestCase):
         self.assertEqual(report["status"], "incomplete_cleanup", report)
         self.assertTrue(report["copies"][0]["uninstaller_verified"])
         self.assertEqual(report["copies"][1]["status"], "declined")
-        self.assertIn("Removal confirmed for 1 of 2", report["message"])
+        self.assertIn("Completed removal for 1 of 2", report["message"])
         execute.assert_called_once()
 
     def test_pending_uninstaller_leaves_later_approved_copies_in_place(self):
@@ -1601,7 +1668,7 @@ class RealAppTests(unittest.TestCase):
                 self.assertEqual(settings.exists(), mode != "all")
                 disk_report = json.loads(Path(report["report_path"]).read_text(encoding="utf-8"))
                 self.assertEqual(disk_report["copies"], report["copies"])
-                self.assertEqual(disk_report["residual_deleted_count"], int(mode != "outside_cleanup"))
+                self.assertEqual(disk_report["residual_quarantined_count"], int(mode != "outside_cleanup"))
                 self.assertEqual(disk_report["cache_files"], [str(executable)] if mode == "file" else [])
                 self.assertEqual(disk_report.get("residual_folders", []), [str(folder)] if mode == "all" else [])
                 events = [json.loads(line) for line in Path(report["audit_path"]).read_text(encoding="utf-8").splitlines()]
@@ -1609,14 +1676,14 @@ class RealAppTests(unittest.TestCase):
                 self.assertEqual(result["copy_approval"], "declined")
                 self.assertEqual(result["status"], status)
 
-    def test_nonstandard_vendor_reboot_and_post_execution_audit_failure(self):
+    def test_vendor_exit_code_does_not_override_the_observed_removal(self):
         command = (str(self.root / "vendor" / "uninstall.exe"),)
         plan = RemovalPlan(self.app, command, "digest", "Google Chrome", "Google LLC",
                            self.root / "vendor", self.root / "vendor" / "editor.exe", "verified")
         real_append = AuditLog.append
 
-        for exit_code, audit_failed, status in ((29, False, "restart_required"), (19, True, "incomplete_cleanup"),
-                                                (20, False, "incomplete_cleanup")):
+        for exit_code, audit_failed, status in ((29, False, "removed"), (20, False, "removed"),
+                                                (19, True, "incomplete_cleanup")):
             with self.subTest(exit_code=exit_code, audit_failed=audit_failed):
                 def append(audit, event, **fields):
                     if audit_failed and event == "uninstaller_exited":
@@ -1628,14 +1695,17 @@ class RealAppTests(unittest.TestCase):
                       patch("uninstallerx.real_apps.prepare_uninstall", return_value=plan),
                       patch("uninstallerx.real_apps._read_installation", side_effect=[self.app, None]),
                       patch("uninstallerx.real_apps.run_vendor", return_value=VendorRun(exit_code)),
-                      patch.object(AuditLog, "append", append), patch.object(ResidualDiscovery, "run") as residuals):
+                      patch("uninstallerx.real_apps.investigate_settings", return_value=([], False)),
+                      patch.object(AuditLog, "append", append),
+                      patch.object(ResidualDiscovery, "run", return_value=([], [], False)) as residuals):
                     report = run_real(self.root, self.model("desktop", "inspect_c1", "propose_c1"), self.app.name,
                                       apply=True, closing=Event(), review=Mock(return_value=True), progress=Mock())
                 self.assertEqual(report["status"], status)
                 self.assertEqual(report["exit_code"], exit_code)
-                self.assertEqual(report.get("uninstaller_verified", False), exit_code != 29)
+                self.assertTrue(report["uninstaller_verified"])
+                self.assertNotIn("exit code", report["message"])
                 self.assertEqual(bool(report.get("audit_write_errors")), audit_failed)
-                residuals.assert_not_called()
+                self.assertEqual(residuals.call_count, int(not audit_failed))
 
     def test_msix_reports_another_version_of_the_same_family(self):
         package = PackageApp("Arbor.Editor", "Arbor.Editor_1.0.0.0_x64__pub", "Arbor.Editor_pub", "CN=Arbor",
@@ -1859,9 +1929,9 @@ class RealAppTests(unittest.TestCase):
                     return {"action": "propose", "target_ids": [folder_id, file_id]}
 
                 def approve(title, rows, detail):
-                    if title.startswith("Permanently delete"):
-                        self.assertEqual(rows, [("Permanently delete whole folder and all contents", str(folder)),
-                                                ("Permanently delete file", str(other_target))])
+                    if title.startswith("Move the proposed leftovers"):
+                        self.assertEqual(rows, [("Move whole folder and all contents", str(folder)),
+                                                ("Move file", str(other_target))])
                         self.assertTrue(child.is_file())
                         self.assertTrue(other_target.is_file())
                         if outcome == "contents changed":
@@ -1884,17 +1954,20 @@ class RealAppTests(unittest.TestCase):
                                       review=approve, progress=Mock())
                 self.assertEqual(result["residual_folders"], [str(folder)], result)
                 self.assertEqual(result["cache_files"], [str(other_target)])
-                self.assertEqual(result["residual_deleted_count"], {"approve": 2, "decline": 0, "contents changed": 1}[outcome])
+                self.assertEqual(result["residual_quarantined_count"], {"approve": 2, "decline": 0, "contents changed": 1}[outcome])
                 self.assertEqual(folder.exists(), outcome != "approve")
                 self.assertEqual(other_target.exists(), outcome == "decline")
                 self.assertTrue(untouched.is_file())
-                self.assertFalse(result["recovery_available"])
-                self.assertFalse((self.root / ".local" / "quarantine").exists())
-                self.assertEqual(result["status"], "removed" if outcome == "approve" else "incomplete_cleanup")
+                self.assertEqual(result["recovery_available"], outcome != "decline")
+                self.assertEqual(result["status"], "incomplete_cleanup" if outcome == "contents changed" else "removed")
                 if outcome == "decline":
                     self.assertEqual(result["residual_declined_count"], 2)
                 if outcome == "approve":
                     self.assertFalse(child.exists())
+                    restored = RecoveryJournal(self.root, result["job_id"]).restore(Mock(return_value=True), Event())
+                    self.assertEqual((restored["restored"], restored["skipped"]), (2, 0), restored)
+                    self.assertEqual(child.read_text(), "Arbor Editor support")
+                    self.assertEqual(other_target.read_text(), "session")
                 if outcome == "contents changed":
                     self.assertTrue(child.is_file())
                     self.assertTrue(change.is_file())
@@ -1980,10 +2053,10 @@ class RealAppTests(unittest.TestCase):
                     report = run_real(self.root, model, item.name, apply=True, closing=Event(), review=review, progress=Mock())
 
                 self.assertEqual(review.call_count, 2)
-                self.assertEqual(review.call_args.args[1], [("Permanently delete file", str(leftover))])
-                self.assertEqual(report["status"], "removed" if approve_cleanup else "incomplete_cleanup", report)
+                self.assertEqual(review.call_args.args[1], [("Move file", str(leftover))])
+                self.assertEqual(report["status"], "removed", report)
                 self.assertTrue(report["primary_removed"])
-                self.assertEqual(report["residual_deleted_count"], int(approve_cleanup))
+                self.assertEqual(report["residual_quarantined_count"], int(approve_cleanup))
                 self.assertEqual(leftover.exists(), not approve_cleanup)
                 self.assertEqual(kept.read_text(), "personal data")
                 self.assertEqual(report.get("residual_declined_count", 0), int(not approve_cleanup))
@@ -2051,18 +2124,18 @@ class RealAppTests(unittest.TestCase):
                                          residual_steps=(start_residuals, "read_d1", examine_cache, propose_cache,
                                                          continue_in_appdata, propose_folder))
         self.assertEqual(report["status"], "removed", report)
-        self.assertEqual(report["residual_deleted_count"], 2)
+        self.assertEqual(report["residual_quarantined_count"], 2)
         self.assertEqual(report["residual_unchecked_roots"], [])
         self.assertEqual(review.call_count, 2)
-        self.assertEqual(review.call_args_list[0].args[1], [("Permanently delete file", str(executable))])
-        self.assertEqual(review.call_args_list[1].args[1], [("Permanently delete file", str(cache)),
-                               ("Permanently delete whole folder and all contents", str(folder))])
+        self.assertEqual(review.call_args_list[0].args[1], [("Move file", str(executable))])
+        self.assertEqual(review.call_args_list[1].args[1], [("Move file", str(cache)),
+                               ("Move whole folder and all contents", str(folder))])
         self.assertFalse(cache.exists())
         self.assertFalse(folder.exists())
         self.assertEqual(kept.read_text(), "reference notes")
         self.assertEqual(unrelated.read_text(), "keep the user's drawing")
 
-    def test_unregistered_portable_deletes_only_approved_binary(self):
+    def test_unregistered_portable_moves_only_approved_binary(self):
         root = self.root / "portable"
         root.mkdir()
         exe = root / "Arbor Editor.exe"
@@ -2073,11 +2146,13 @@ class RealAppTests(unittest.TestCase):
         result = self._run_portable_case(root, exe, "Arbor Editor", review, {"target_ids": ["F1"]})
         self.assertEqual(result["status"], "removed")
         self.assertEqual(result["portable_files"], [str(exe)])
-        self.assertEqual(result["portable_deleted_count"], 1)
-        self.assertFalse(result.get("recovery_available"))
-        self.assertFalse((self.root / ".local" / "quarantine").exists())
+        self.assertEqual(result["portable_quarantined_count"], 1)
+        self.assertTrue(result["recovery_available"])
         self.assertFalse(exe.exists())
         self.assertEqual(document.read_text(), "user data")
+        restored = RecoveryJournal(self.root, result["job_id"]).restore(Mock(return_value=True), Event())
+        self.assertEqual((restored["restored"], restored["skipped"]), (1, 0), restored)
+        self.assertTrue(exe.is_file())
 
     def test_portable_search_can_resume_another_local_volume_beyond_four_levels(self):
         volume = self.root / "another-volume"
@@ -2387,9 +2462,9 @@ class RealAppTests(unittest.TestCase):
                 else:
                     self.assertFalse(shared.exists())
                     self.assertEqual(second["previously_removed_targets"], [str(shared)])
-                    self.assertEqual(second["portable_deleted_count"], 1)
+                    self.assertEqual(second["portable_quarantined_count"], 1)
 
-    def test_copy_removed_after_incomplete_search_is_reported_as_partial(self):
+    def test_copy_removed_after_incomplete_search_is_reported_as_removed_with_a_note(self):
         folder = self.root / "first"
         folder.mkdir()
         exe = folder / "Aster Tool.exe"
@@ -2401,8 +2476,9 @@ class RealAppTests(unittest.TestCase):
               patch("uninstallerx.real_apps.residual_search_roots", return_value=[])):
             report = run_real(self.root, model, "Aster Tool", apply=True, closing=Event(), review=Mock(return_value=True),
                               progress=Mock(), portable_roots=(folder,))
-        self.assertEqual(report["status"], "incomplete_cleanup", report)
+        self.assertEqual(report["status"], "removed", report)
         self.assertTrue(report["search_incomplete"])
+        self.assertTrue(report["investigation_incomplete"])
         self.assertEqual(report["copies"][0]["status"], "removed")
         self.assertFalse(exe.exists())
 
@@ -2429,14 +2505,14 @@ class RealAppTests(unittest.TestCase):
                         self.assertFalse(folder.exists())
                     else:
                         self.assertEqual(result["status"], "blocked")
-                        self.assertEqual(result["portable_delete_winerror"], 32)
-                        self.assertEqual(result["portable_deleted_count"], 0)
+                        self.assertEqual(result["portable_quarantine_winerror"], 32)
+                        self.assertEqual(result["portable_quarantined_count"], 0)
                         self.assertTrue(exe.is_file())
                         self.assertTrue(manual.is_file())
                 finally:
                     _kernel.CloseHandle(reader)
 
-    def test_portable_distribution_deletes_nested_folder_and_matching_zip(self):
+    def test_portable_distribution_moves_nested_folder_and_matching_zip(self):
         root = self.root / "search"
         folder = root / "release-7 unpacked"
         nested = folder / "bin"
@@ -2459,15 +2535,15 @@ class RealAppTests(unittest.TestCase):
         result = self._run_portable_case(root, exe, "Quill Reader", review, {"target_ids": ["D1"]}, {"archive_id": "Z1"})
 
         self.assertEqual(result["status"], "removed")
-        self.assertEqual(result["portable_deleted_count"], 3)
-        self.assertIn(("Delete this folder and all its contents", str(folder)), review.call_args.args[1])
-        self.assertIn(("Permanently delete matching distribution ZIP", str(source)), review.call_args.args[1])
+        self.assertEqual(result["portable_quarantined_count"], 3)
+        self.assertIn(("Move this folder and all its contents", str(folder)), review.call_args.args[1])
+        self.assertIn(("Move matching distribution ZIP", str(source)), review.call_args.args[1])
         self.assertFalse(folder.exists())
         self.assertFalse(source.exists())
         self.assertTrue(decoy.is_file())
         self.assertEqual(other.read_text(), "user data")
 
-    def test_portable_removes_readonly_files_and_directories(self):
+    def test_portable_moves_readonly_files_and_directories(self):
         root = self.root / "search"
         folder = root / "Aster Tool"
         nested = folder / "support"
@@ -2484,9 +2560,9 @@ class RealAppTests(unittest.TestCase):
         result = self._run_portable_case(root, exe, "Aster Tool", Mock(return_value=True), {"target_ids": ["D1"]})
 
         self.assertEqual(result["status"], "removed", result)
-        self.assertEqual(result["portable_deleted_count"], 2)
+        self.assertEqual(result["portable_quarantined_count"], 2)
         self.assertFalse(folder.exists())
-        self.assertEqual(list(root.iterdir()), [outside])
+        self.assertEqual({child.name for child in root.iterdir()}, {outside.name, ".uninstallerx-recovery"})
 
     def test_locked_portable_file_stops_before_the_folder_is_moved(self):
         root = self.root / "search"
@@ -2504,50 +2580,35 @@ class RealAppTests(unittest.TestCase):
         finally:
             _kernel.CloseHandle(reader)
         self.assertEqual(result["status"], "blocked", result)
-        self.assertEqual(result["portable_delete_stage"], "check_file_access")
-        self.assertEqual(result["portable_delete_operation"], "CreateFileW")
-        self.assertEqual(result["portable_delete_winerror"], 32)
-        self.assertEqual(result["portable_deleted_count"], 0)
+        self.assertEqual(result["portable_quarantine_stage"], "check_file_access")
+        self.assertEqual(result["portable_quarantine_operation"], "CreateFileW")
+        self.assertEqual(result["portable_quarantine_winerror"], 32)
+        self.assertEqual(result["portable_quarantined_count"], 0)
         self.assertTrue(exe.is_file() and other.is_file())
         self.assertEqual(list(root.iterdir()), [folder])
 
-    def test_late_folder_failure_keeps_remaining_files_outside_original_path(self):
-        for fail_after_first in (False, True):
-            with self.subTest(fail_after_first=fail_after_first):
-                root = self.root / str(fail_after_first)
-                folder = root / "Aster Tool"
-                folder.mkdir(parents=True)
-                exe = folder / "Aster Tool.exe"
-                shutil.copyfile(sys.executable, exe)
-                other = folder / "support.txt"
-                other.write_text("remaining file")
+    def test_failed_folder_move_leaves_the_folder_in_place(self):
+        root = self.root / "search"
+        folder = root / "Aster Tool"
+        folder.mkdir(parents=True)
+        exe = folder / "Aster Tool.exe"
+        shutil.copyfile(sys.executable, exe)
+        other = folder / "support.txt"
+        other.write_text("remaining file")
 
-                def fail_at(target):
-                    self.assertTrue(target.path.parent.name.startswith(".uninstallerx-removing-"))
-                    self.assertFalse(folder.exists())
-                    if not fail_after_first or target.path.name == other.name:
-                        raise ctypes.WinError(5)
-                    delete_verified(target)
+        with patch("uninstallerx.real_apps.move_verified", side_effect=ctypes.WinError(5)):
+            result = self._run_portable_case(root, exe, "Aster Tool", Mock(return_value=True), {"target_ids": ["D1"]})
 
-                with patch("uninstallerx.real_apps.delete_verified", side_effect=fail_at):
-                    result = self._run_portable_case(root, exe, "Aster Tool", Mock(return_value=True), {"target_ids": ["D1"]})
+        self.assertEqual(result["status"], "blocked", result)
+        self.assertEqual(result["portable_quarantine_stage"], "move_folder")
+        self.assertEqual(result["portable_quarantine_winerror"], 5)
+        self.assertEqual(result["portable_quarantined_count"], 0)
+        self.assertNotIn("portable_pending_path", result)
+        self.assertFalse(result["recovery_available"])
+        self.assertTrue(exe.is_file())
+        self.assertEqual(other.read_text(), "remaining file")
 
-                self.assertEqual(result["portable_delete_winerror"], 5, result)
-                self.assertEqual(result["portable_deleted_count"], int(fail_after_first))
-                if fail_after_first:
-                    self.assertEqual(result["status"], "incomplete_cleanup")
-                    pending = Path(result["portable_pending_path"])
-                    self.assertEqual(pending.parent, root)
-                    self.assertFalse(folder.exists())
-                    self.assertEqual((pending / other.name).read_text(), "remaining file")
-                    self.assertFalse((pending / exe.name).exists())
-                else:
-                    self.assertEqual(result["status"], "blocked")
-                    self.assertNotIn("portable_pending_path", result)
-                    self.assertTrue(exe.is_file() and other.is_file())
-                    self.assertEqual(list(root.iterdir()), [folder])
-
-    def test_portable_restores_folder_with_unapproved_content_after_relocation(self):
+    def test_portable_returns_folder_with_unapproved_content_after_the_move(self):
         root = self.root / "search"
         folder = root / "Aster Tool"
         folder.mkdir(parents=True)
@@ -2556,19 +2617,18 @@ class RealAppTests(unittest.TestCase):
         added = "newly created.txt"
 
         def add_after_moving(source, destination, check_contents=None):
-            rename_sibling_verified(source, destination, check_contents)
+            move_verified(source, destination, check_contents)
             if destination != folder:
                 (destination / added).write_text("outside approved snapshot")
 
-        with patch("uninstallerx.real_apps.rename_sibling_verified", side_effect=add_after_moving):
+        with patch("uninstallerx.real_apps.move_verified", side_effect=add_after_moving):
             result = self._run_portable_case(root, exe, "Aster Tool", Mock(return_value=True), {"target_ids": ["D1"]})
 
         self.assertEqual(result["status"], "blocked", result)
-        self.assertEqual(result["portable_delete_stage"], "verify_staged_folder")
-        self.assertEqual(result["portable_deleted_count"], 0)
+        self.assertEqual(result["portable_quarantine_stage"], "verify_moved_folder")
+        self.assertEqual(result["portable_quarantined_count"], 0)
         self.assertTrue(exe.is_file())
         self.assertEqual((folder / added).read_text(), "outside approved snapshot")
-        self.assertEqual(list(root.iterdir()), [folder])
 
     def test_portable_distribution_preserves_files_not_in_zip(self):
         root = self.root / "search"
@@ -2642,8 +2702,8 @@ class RealAppTests(unittest.TestCase):
 
         review = Mock(return_value=True)
         result = self._run_portable_case(root, exe, "Juniper Viewer", review, self.read_document("README.md"), choose_files)
-        self.assertEqual(review.call_args.args[1], [("Permanently delete file", str(exe)),
-                                                   ("Permanently delete file", str(support))])
+        self.assertEqual(review.call_args.args[1], [("Move file", str(exe)),
+                                                   ("Move file", str(support))])
         self.assertEqual(result["status"], "removed", result)
         self.assertFalse(exe.exists() or support.exists())
         self.assertTrue(folder.is_dir() and personal.is_file())
@@ -2714,7 +2774,7 @@ class RealAppTests(unittest.TestCase):
 
         result = self._run_portable_case(root, exe, "Ridge Tool", approve_with_changed_folder, {"target_ids": ["D1"]})
         self.assertEqual(result["status"], "blocked")
-        self.assertEqual(result["portable_deleted_count"], 0)
+        self.assertEqual(result["portable_quarantined_count"], 0)
         self.assertTrue(exe.is_file())
         self.assertTrue(doc.is_file())
 
@@ -2745,7 +2805,7 @@ class RealAppTests(unittest.TestCase):
         result = self._run_portable_case(root, exe, "Pine Desk", review, choose_file, keep_archive,
                                          user_request="Remove Pine Desk and keep the ZIP and documents.")
         self.assertEqual(result["status"], "removed")
-        self.assertEqual(review.call_args.args[1], [("Permanently delete file", str(exe))])
+        self.assertEqual(review.call_args.args[1], [("Move file", str(exe))])
         self.assertFalse(exe.exists())
         self.assertTrue(manual.is_file())
         self.assertTrue(source.is_file())
@@ -2775,7 +2835,7 @@ class RealAppTests(unittest.TestCase):
 
         result = self._run_portable_case(root, exe, "Juniper Pad", review, {"target_ids": ["D1"]}, {"archive_id": "Z2"})
         self.assertEqual(result["status"], "removed")
-        self.assertIn(("Permanently delete matching distribution ZIP", str(archives[1])), review.call_args.args[1])
+        self.assertIn(("Move matching distribution ZIP", str(archives[1])), review.call_args.args[1])
         self.assertFalse(folder.exists())
         self.assertTrue(archives[0].is_file())
         self.assertFalse(archives[1].exists())

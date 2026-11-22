@@ -24,7 +24,7 @@ from .windows import has_reparse_component, is_within, normalized_path
 
 
 MAX_PACKAGE_ENTRIES = 4096
-STAGED_FOLDER_PREFIX = ".uninstallerx-removing-"
+RECOVERY_FOLDER = ".uninstallerx-recovery"
 MAX_PACKAGE_BYTES = 2 * 1024 ** 3
 MAX_ARCHIVES = 80
 PORTABLE_SCAN_ENTRIES = 6000
@@ -98,14 +98,13 @@ def _below(path: Path, root: Path) -> bool:
     return normalized_path(path) != normalized_path(root) and is_within(path, root)
 
 
-def _protected(path: Path, *, recovery: bool = False, browsing: bool = False, staged: bool = False) -> bool:
+def _protected(path: Path, *, recovery: bool = False, browsing: bool = False) -> bool:
     protected = [Path(os.environ[key]) for key in ("SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData",
                                                   "ProgramW6432") if os.environ.get(key)]
     protected_names = {"$recycle.bin", "system volume information", "windowsapps", ".git"}
     if not recovery:
-        protected_names.add(".uninstallerx-recovery")
+        protected_names.add(RECOVERY_FOLDER)
     return (any(is_within(path, root) or (not browsing and is_within(root, path)) for root in protected)
-            or (not staged and any(re.fullmatch(r"\.uninstallerx-removing-[0-9a-f]{32}", part, re.I) for part in path.parts))
             or any(part.casefold() in protected_names for part in path.parts))
 
 
@@ -181,10 +180,10 @@ def verify_file(file: PortableFile, app: PortableApp) -> bool:
     return safe_portable_path(file.path, app.search_root) and fingerprint(file.path) == file
 
 
-def package_tree(folder: Path, closing: Event, *, recovery: bool = False,
-                 staged: bool = False) -> tuple[tuple[PortableFile, ...], tuple[PortableDirectory, ...]]:
+def package_tree(folder: Path, closing: Event, *,
+                 recovery: bool = False) -> tuple[tuple[PortableFile, ...], tuple[PortableDirectory, ...]]:
     """Record only regular files and directories. Refuse trees containing redirects or special files."""
-    if not _local_path(folder) or _protected(folder, recovery=recovery, staged=staged):
+    if not _local_path(folder) or _protected(folder, recovery=recovery):
         raise ValueError("The package folder is outside the portable app policy.")
     pending = [folder]
     files: list[PortableFile] = []
@@ -197,7 +196,7 @@ def package_tree(folder: Path, closing: Event, *, recovery: bool = False,
                 if closing.is_set() or len(files) + len(directories) >= MAX_PACKAGE_ENTRIES:
                     raise ValueError("The package tree could not be fully inspected.")
                 path = Path(entry.path)
-                if not _local_path(path) or _protected(path, recovery=recovery, staged=staged) or not _below(path, folder):
+                if not _local_path(path) or _protected(path, recovery=recovery) or not _below(path, folder):
                     raise ValueError("The package tree contains a protected or redirected path.")
                 info = entry.stat(follow_symlinks=False)
                 if stat.S_ISDIR(info.st_mode):

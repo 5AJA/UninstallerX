@@ -32,7 +32,7 @@ UninstallerX is a Windows app removal agent. A local model identifies the reques
 | Execution | Gate ↔ cleanup tools | Prioritize installation records over app-provided text. Before execution, recheck app identity, path redirection, shared or protected locations, the operation, and approval. Block protected targets and show the exact path when requesting approval for an ambiguous target. | The system or user can make a mistake when assessing ownership or approving an action. |
 | Recovery | Gate ↔ cleanup tools | Quarantine files eligible for recovery, keep decision logs outside the model's reach, and enforce the job budget. | Vendor uninstallers can make irreversible changes. |
 
-The current Windows release permanently deletes approved leftover files and folders. Users can restore backed-up registry values.
+The current Windows release moves approved portable app files and leftover files and folders into a recovery folder and backs up removed registry values. The recovery folder is `.uninstallerx-recovery\<job id>` inside the location that was cleaned. Users can restore both from the result card or with `python -m uninstallerx restore <job id>`. Nothing in a recovery folder is deleted automatically.
 
 ## Quick Start
 

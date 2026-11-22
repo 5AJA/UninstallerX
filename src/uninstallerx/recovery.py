@@ -8,6 +8,7 @@ import re
 import secrets
 import stat
 import tempfile
+import uuid
 import winreg
 from collections.abc import Callable
 from dataclasses import asdict
@@ -15,7 +16,7 @@ from pathlib import Path
 from threading import Event
 
 from .audit import AuditLog
-from .portable_apps import package_tree
+from .portable_apps import RECOVERY_FOLDER, package_tree
 from .portable_files import PortableDirectory, PortableFile, directory_identity, move_verified
 from .registry_settings import Setting, _actual_path, eligible_value, exact_user_key
 from .windows import has_reparse_component, is_within, normalized_path
@@ -60,8 +61,8 @@ def _canonical(payload: dict) -> bytes:
 
 def folder_manifest(folder: Path, files: tuple[PortableFile, ...], directories: tuple[PortableDirectory, ...]) -> str:
     return hashlib.sha256(_canonical({
-        "files": [(str(item.path.relative_to(folder)), item.identity, item.digest) for item in files],
-        "folders": [(str(item.path.relative_to(folder)), item.identity) for item in directories],
+        "files": sorted((str(item.path.relative_to(folder)), item.identity, item.digest) for item in files),
+        "folders": sorted((str(item.path.relative_to(folder)), item.identity) for item in directories),
     })).hexdigest()
 
 
@@ -128,6 +129,12 @@ class RecoveryJournal:
         finally:
             staging.unlink(missing_ok=True)
 
+    def backup_path(self, scope: Path) -> Path:
+        """Reserve a name on the scope's own volume, so the move and its restore stay renames."""
+        folder = scope / RECOVERY_FOLDER / self.job_id
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder / uuid.uuid4().hex
+
     def record_file(self, source: Path, backup: Path, scope: Path) -> None:
         if not _safe(scope) or not _child(source, scope) or not self._allowed_backup(backup, scope):
             raise PermissionError("The file is outside the approved recovery boundaries.")
@@ -144,9 +151,7 @@ class RecoveryJournal:
         self._append({"operation": "setting", "setting": asdict(setting), "native_key": _actual_path(opened_key)})
 
     def _allowed_backup(self, backup: Path, scope: Path) -> bool:
-        allowed = (self.repo_root / ".local" / "quarantine" / self.job_id,
-                   scope / ".uninstallerx-recovery" / self.job_id)
-        return _safe(backup) and any(backup.parent == root for root in allowed)
+        return _safe(backup) and backup.parent == scope / RECOVERY_FOLDER / self.job_id
 
     def _restore_file(self, entry: dict) -> None:
         source, backup, scope = (Path(entry[key]) for key in ("source", "backup", "scope"))

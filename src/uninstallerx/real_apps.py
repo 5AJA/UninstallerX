@@ -27,16 +27,19 @@ from .live_reasoning import BudgetApproval, InvestigationError, InvestigationMod
 from .model_provider import ModelContextError, ModelError, ModelOutputLimitError
 from .packaged_apps import PackageApp, packaged_apps, removal_block, remove_package
 from .portable_apps import (
-    STAGED_FOLDER_PREFIX, PortableApp, PortableCandidate, inspect_portable, observe_portable_distributions, package_tree, portable_file_inventory,
+    RECOVERY_FOLDER, PortableApp, PortableCandidate, inspect_portable, observe_portable_distributions, package_tree, portable_file_inventory,
     portable_query_key, portable_search_area, read_portable_executables, read_portable_text, safe_portable_path, search_areas, verify_file,
 )
 from .portable_files import (
-    PortableDirectory, PortableFile, check_delete_access, delete_verified, directory_identity,
-    fingerprint, rename_sibling_verified,
+    PortableDirectory, PortableFile, check_delete_access, directory_identity, fingerprint, move_verified,
 )
 from .portable_targets import PortableTargets
-from .recovery import RecoveryJournal
+from .recovery import RecoveryJournal, folder_manifest
 from .registry_settings import Setting, exact_user_key, investigate_settings, same_setting
+from .vendor_policy import (
+    RESTART_EXIT_CODES, BinaryInfo, approval_warning, label as _label, primary_matches, related as _related,
+    unconfirmed_removal, uninstaller_identity,
+)
 from .vendor_process import run_vendor
 from .windows import has_reparse_component, is_within, normalized_path, system_directory
 
@@ -115,7 +118,6 @@ Examples when Z1 is the only verified ZIP:
 
 VALUES = ("DisplayName", "Publisher", "DisplayVersion", "InstallLocation", "DisplayIcon", "UninstallString", "WindowsInstaller", "SystemComponent")
 GUID = re.compile(r"\{[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}")
-INSTALLER_ENGINE_PRODUCTS = {"inno setup", "nullsoft install system", "nullsoft scriptable install system", "installshield"}
 CACHE_NAMES = {"cache", "code cache", "gpucache", "cache2"}
 MAX_CHANGES = 50
 MAX_VISITS = 1600
@@ -123,9 +125,6 @@ MAX_RESIDUAL_OBSERVATIONS = 400
 MAX_RESIDUAL_TEXT_BYTES = 2048
 WINDOWS_INVENTORIES = {"desktop": "Search HKCU/HKLM desktop and MSI registrations by app name",
                        "packages": "Search current-user Windows MSIX/AppX packages by app name"}
-RESTART_EXIT_CODES = {1641, 3010}
-# Chromium's setup.exe publishes its own Windows uninstall status codes.
-VENDOR_EXIT_CODES = {("google llc", "google chrome"): {20: "failed", 21: "cancelled", 29: "restart"}}
 
 
 @dataclass(frozen=True)
@@ -155,13 +154,6 @@ class Installation:
 
 
 @dataclass(frozen=True)
-class BinaryInfo:
-    signer: str
-    product: str
-    subject: str = ""
-
-
-@dataclass(frozen=True)
 class RemovalPlan:
     app: Installation
     command: tuple[str, ...]
@@ -171,6 +163,8 @@ class RemovalPlan:
     app_root: Path | None
     primary: Path | None
     evidence: str
+    # Set when only the installation record ties the uninstaller to the app.
+    warning: str = ""
 
 
 @dataclass(frozen=True)
@@ -193,14 +187,14 @@ class ResidualFolder:
 ResidualTarget = PortableFile | ResidualFolder
 
 
-def _label(value: str) -> str:
-    value = re.sub(r"\s+\([^)]*\)\s*$", "", value)
-    return " ".join(re.findall(r"[\w+]+", value.casefold()))
+def _id_array(ids: Iterable[str]) -> dict:
+    # An unbounded array lets the local model repeat IDs until it reaches its output limit.
+    ids = list(ids)
+    return {"type": "array", "items": {"type": "string", "enum": ids}, "maxItems": len(ids)}
 
 
-def _related(left: str, right: str) -> bool:
-    left, right = _label(left), _label(right)
-    return bool(left and right and (f" {left} " in f" {right} " or f" {right} " in f" {left} "))
+def _is_msi(app: Installation) -> bool:
+    return app.values.get("WindowsInstaller") == 1 and bool(GUID.fullmatch(app.key))
 
 
 def _read_installation(hive: int, view: int, name: str) -> Installation | None:
@@ -273,8 +267,10 @@ def _matching_catalog(name: str, apps: Iterable[Installation | PackageApp]) -> l
 
 
 def _drive_path(path: Path) -> bool:
+    # A recovery folder holds quarantined data. It is never read or proposed.
     return (path.is_absolute() and bool(re.fullmatch(r"[a-zA-Z]:", path.drive))
             and ".." not in path.parts and ":" not in str(path)[2:]
+            and all(part.casefold() != RECOVERY_FOLDER for part in path.parts)
             and not has_reparse_component(path, path.anchor))
 
 
@@ -353,7 +349,7 @@ def _uninstall_command(app: Installation) -> tuple[str, ...]:
 
 
 def _registered_target(app: Installation) -> tuple[str, ...]:
-    if app.values.get("WindowsInstaller") == 1 and GUID.fullmatch(app.key):
+    if _is_msi(app):
         exe = system_directory() / "msiexec.exe"
         return str(exe), "/x", app.key, "/norestart"
     return _uninstall_command(app)
@@ -914,7 +910,7 @@ class LiveDiscovery:
             if scans or rescans or "query_windows" in actions:
                 fields["query"] = {"type": "string"}
             if "search_locations" in actions:
-                fields["locations"] = {"type": "array", "items": {"enum": scans}}
+                fields["locations"] = _id_array(scans)
             if any(key.startswith("skip_") for key in actions):
                 fields["reason"] = {"enum": ["unrelated", "uncertain"]}
             self.progress("The local model is choosing where to look…" if not self.proposals else
@@ -995,7 +991,8 @@ class LiveDiscovery:
 
 
 def prepare_uninstall(app: Installation) -> RemovalPlan:
-    if app.values.get("WindowsInstaller") == 1 and GUID.fullmatch(app.key):
+    """Gate a registered uninstaller: deny it, verify it, or return it with a warning for approval."""
+    if _is_msi(app):
         product = _msi_product(app.key)
         if not _related(product, app.name):
             raise ValueError("Windows Installer did not confirm an installation for this product.")
@@ -1010,9 +1007,6 @@ def prepare_uninstall(app: Installation) -> RemovalPlan:
     uninstall = Path(command[0])
     if not _app_location(uninstall) or uninstall.suffix.casefold() != ".exe" or not uninstall.is_file():
         raise ValueError("The uninstaller is outside the supported local installation folders.")
-    uninstall_name = uninstall.stem.casefold()
-    dedicated = bool("uninstall" in uninstall_name or re.fullmatch(r"unins[0-9]+", uninstall_name)
-                     or uninstall.parent.name.casefold() == "uninstall")
 
     icon = str(app.values.get("DisplayIcon", "")).strip()
     primary_hint = Path(re.sub(r",\s*-?\d+\s*$", "", icon).strip('"'))
@@ -1021,51 +1015,58 @@ def prepare_uninstall(app: Installation) -> RemovalPlan:
     if not _app_location(root) or not root.is_dir():
         raise ValueError("Could not verify the application installation folder.")
     same_folder = _in_child(uninstall, root)
-    if not same_folder and not any(
-        _in_child(uninstall, parent) for parent in (*_program_dirs(), *(path / "Package Cache" for path in _roots("ProgramData")))
+    in_program_files = any(_in_child(uninstall, parent) for parent in _program_dirs())
+    if not same_folder and not in_program_files and not any(
+        _in_child(uninstall, path / "Package Cache") for path in _roots("ProgramData")
     ):
         raise ValueError("The separate uninstaller is outside the supported system installation locations.")
     uninstall_info = _binary_info(uninstall)
-    product_match = _related(uninstall_info.product, app.name)
-    engine_product = _label(uninstall_info.product)
-    generic_engine = (same_folder and dedicated and (not engine_product or engine_product in INSTALLER_ENGINE_PRODUCTS)
-                      and _related(app.publisher, uninstall_info.signer))
-    if not uninstall_info.signer or not (product_match or generic_engine):
-        raise ValueError("The signed uninstaller does not identify the registered app's product.")
+    identity = uninstaller_identity(app.name, app.publisher, uninstall, uninstall_info, same_folder)
+
+    def app_executable(path: Path) -> bool:
+        return (path.suffix.casefold() == ".exe" and path != uninstall and _in_child(path, root)
+                and _drive_path(path) and path.is_file())
 
     def verify_primary(path: Path) -> BinaryInfo | None:
-        if (path.suffix.casefold() != ".exe" or path == uninstall or not _in_child(path, root)
-                or not _drive_path(path) or not path.is_file()):
+        if not app_executable(path):
             return None
         info = _binary_info(path)
-        if (_label(info.signer) == _label(uninstall_info.signer) and info.subject.casefold() == uninstall_info.subject.casefold()
-                and _related(info.product, app.name)
-                and (generic_engine or _related(info.product, uninstall_info.product))):
-            return info
-        return None
+        return info if primary_matches(app.name, info, uninstall_info, identity.generic_engine) else None
 
-    primary = primary_hint
-    info = verify_primary(primary)
-    if info is None:
-        needles = {re.sub(r"\W+", "", _label(name)) for name in (app.name, uninstall_info.product)}
-        candidates = []
-        for folder in (root, root / "bin"):
-            if not _drive_path(folder) or not folder.is_dir():
-                continue
-            with os.scandir(folder) as entries:
-                for entry in islice(entries, 256):
-                    path = Path(entry.path)
-                    stem = re.sub(r"\W+", "", _label(path.stem))
-                    if path.suffix.casefold() == ".exe" and stem and any(stem == name for name in needles):
-                        if observed := verify_primary(path):
-                            candidates.append((path, observed))
-        if len(candidates) != 1:
-            raise ValueError("Could not identify one independently signed primary executable for the registered app.")
-        primary, info = candidates[0]
-    evidence = ("The signed app and its dedicated uninstaller share a publisher and installation folder."
-                if generic_engine and not product_match else
-                "The app and uninstaller have valid matching publisher signatures and matching product metadata.")
-    return RemovalPlan(app, command, _digest(uninstall), info.product, info.signer, root, primary, evidence)
+    concern = identity.concern
+    if identity.verified:
+        primary = primary_hint
+        info = verify_primary(primary)
+        if info is None:
+            needles = {re.sub(r"\W+", "", _label(name)) for name in (app.name, uninstall_info.product)}
+            candidates = []
+            for folder in (root, root / "bin"):
+                if not _drive_path(folder) or not folder.is_dir():
+                    continue
+                with os.scandir(folder) as entries:
+                    for entry in islice(entries, 256):
+                        path = Path(entry.path)
+                        stem = re.sub(r"\W+", "", _label(path.stem))
+                        if path.suffix.casefold() == ".exe" and stem and any(stem == name for name in needles):
+                            if observed := verify_primary(path):
+                                candidates.append((path, observed))
+            if len(candidates) == 1:
+                primary, info = candidates[0]
+        if info is not None:
+            evidence = ("The signed app and its dedicated uninstaller share a publisher and installation folder."
+                        if identity.generic_engine and not identity.product_match else
+                        "The app and uninstaller have valid matching publisher signatures and matching product metadata.")
+            return RemovalPlan(app, command, _digest(uninstall), info.product, info.signer, root, primary, evidence)
+        concern = "No independently signed app executable confirms the uninstaller's publisher."
+
+    # The installation record is the only ownership evidence left, so the approver decides on the exact file.
+    if not same_folder:
+        raise ValueError(f"{concern} An uninstaller outside the app's installation folder needs a verified signature.")
+    warning = approval_warning(concern, machine_record=app.hive == winreg.HKEY_LOCAL_MACHINE,
+                               in_program_files=in_program_files)
+    return RemovalPlan(app, command, _digest(uninstall), app.name, "", root,
+                       primary_hint if app_executable(primary_hint) else None,
+                       "The Windows installation record names this uninstaller.", warning)
 
 
 def residual_search_roots(on_error: Callable[[Path, OSError], None] | None = None) -> list[Path]:
@@ -1203,7 +1204,7 @@ class _FolderCleanupError(OSError):
 def _retry_sharing_conflict(operation: Callable[[], None], closing: Event) -> None:
     for delay in (0.1, 0.25, None):
         if closing.is_set():
-            raise ValueError("Deletion was stopped.")
+            raise ValueError("The move was stopped.")
         try:
             operation()
             return
@@ -1212,27 +1213,29 @@ def _retry_sharing_conflict(operation: Callable[[], None], closing: Event) -> No
                 raise
 
 
-def _delete_approved_folder(
-    folder: Path, files: tuple[PortableFile, ...], directories: tuple[PortableDirectory, ...],
-    audit: AuditLog, closing: Event, on_deleted: Callable[[PortableFile | PortableDirectory], None],
+def _quarantine_file(file: PortableFile, scope: Path, journal: RecoveryJournal, closing: Event) -> None:
+    _retry_sharing_conflict(lambda: check_delete_access(file), closing)
+    backup = journal.backup_path(scope)
+    # The authenticated record exists before the file leaves its original location.
+    journal.record_file(file.path, backup, scope)
+    _retry_sharing_conflict(lambda: move_verified(file, backup), closing)
+
+
+def _quarantine_folder(
+    folder: Path, files: tuple[PortableFile, ...], directories: tuple[PortableDirectory, ...], scope: Path,
+    journal: RecoveryJournal, audit: AuditLog, closing: Event,
 ) -> None:
     root = next(item for item in directories if item.path == folder)
-    staged = folder.with_name(STAGED_FOLDER_PREFIX + uuid.uuid4().hex)
-    staged_files = tuple(replace(item, path=staged / item.path.relative_to(folder)) for item in files)
-    staged_directories = tuple(replace(item, path=staged / item.path.relative_to(folder)) for item in directories)
-    staged_root = replace(root, path=staged)
+    manifest = folder_manifest(folder, files, directories)
 
-    def check_tree(path: Path, file_snapshot: tuple[PortableFile, ...],
-                   directory_snapshot: tuple[PortableDirectory, ...], *, moved: bool = False) -> None:
-        found_files, found_directories = package_tree(path, closing, staged=moved)
-        if set(found_files) != set(file_snapshot) or found_directories != directory_snapshot:
+    def check_approved() -> None:
+        found_files, found_directories = package_tree(folder, closing)
+        if set(found_files) != set(files) or found_directories != directories:
             raise ValueError("The folder contents changed after approval.")
 
     stage = "check_directory_access"
     target = folder
-    relocated = False
-    deleted = 0
-    purging = False
+    backup = None
     try:
         for directory in reversed(directories):
             target = directory.path
@@ -1242,75 +1245,62 @@ def _delete_approved_folder(
             target = file.path
             _retry_sharing_conflict(lambda: check_delete_access(file), closing)
 
-        stage, target = "stage_folder", folder
-        audit.append("folder_cleanup_planned", source=str(folder), staged_path=str(staged))
-        _retry_sharing_conflict(lambda: rename_sibling_verified(root, staged, lambda: check_tree(folder, files, directories)), closing)
-        relocated = True
-        audit.append("folder_cleanup_staged", source=str(folder), staged_path=str(staged))
-
-        stage = "verify_staged_folder"
-        check_tree(staged, staged_files, staged_directories, moved=True)
-        stage = "delete"
-        for original, moved in zip((*files, *directories), (*staged_files, *staged_directories)):
-            target = original.path
-            if closing.is_set():
-                raise ValueError("Deletion was stopped.")
-            purging = True
-            _retry_sharing_conflict(lambda: delete_verified(moved), closing)
-            deleted += 1
-            if original == root:
-                relocated = False
-            on_deleted(original)
-        audit.append("folder_cleanup_completed", source=str(folder), staged_path=str(staged))
+        stage, target = "move_folder", folder
+        destination = journal.backup_path(scope)
+        journal.record_folder(folder, destination, scope, manifest)
+        audit.append("folder_quarantine_planned", source=str(folder), backup=str(destination))
+        _retry_sharing_conflict(lambda: move_verified(root, destination, check_approved), closing)
+        backup = destination
+        stage = "verify_moved_folder"
+        if folder_manifest(backup, *package_tree(backup, closing, recovery=True)) != manifest:
+            raise ValueError("The folder contents changed after approval.")
+        audit.append("folder_quarantined", source=str(folder), backup=str(backup))
     except (OSError, ValueError) as exc:
-        remaining = staged if relocated else None
         restore_error = None
-        if relocated and not deleted:
+        if backup is not None:
             try:
-                check = (lambda: check_tree(staged, staged_files, staged_directories, moved=True)) if purging else None
-                rename_sibling_verified(staged_root, folder, check)
-                remaining = None
+                move_verified(directory_identity(backup), folder)
+                backup = None
             except (OSError, ValueError) as error:
                 restore_error = error
-        raise _FolderCleanupError(target, stage, exc, remaining, restore_error) from exc
+        raise _FolderCleanupError(target, stage, exc, backup, restore_error) from exc
 
 
-def delete_residuals(
-    targets: list[ResidualTarget], roots: list[Path], audit: AuditLog, closing: Event,
+def quarantine_residuals(
+    targets: list[ResidualTarget], roots: list[Path], journal: RecoveryJournal, audit: AuditLog, closing: Event,
     record_removal: Callable[[PortableFile | PortableDirectory], None],
 ) -> tuple[int, list[str]]:
-    deleted = 0
+    moved = 0
     pending = []
     for target in targets:
         if closing.is_set():
             break
         path = target.path
-
-        def record_deleted(item: PortableFile | PortableDirectory) -> None:
-            record_removal(item)
-            audit.append("residual_deleted", target=str(item.path), approved_target=str(path))
-
         try:
-            _residual_scope(path, roots)
+            scope = _residual_scope(path, roots)
             if is_within(audit.path.parent.parent, path):
                 raise ValueError("The target contains the active UninstallerX workspace.")
-            audit.append("residual_delete_approved", target=str(path))
+            audit.append("residual_quarantine_approved", target=str(path))
             if isinstance(target, ResidualFolder):
-                _delete_approved_folder(path, target.files, target.directories, audit, closing, record_deleted)
+                _quarantine_folder(path, target.files, target.directories, scope, journal, audit, closing)
+                items = (*target.files, *target.directories)
             else:
-                _retry_sharing_conflict(lambda: delete_verified(target), closing)
-                record_deleted(target)
-            deleted += 1
+                _quarantine_file(target, scope, journal, closing)
+                items = (target,)
+            for item in items:
+                record_removal(item)
+                audit.append("residual_quarantined", target=str(item.path), approved_target=str(path))
+            moved += 1
         except _FolderCleanupError as exc:
             remaining = str(exc.remaining) if exc.remaining else None
             if remaining:
                 pending.append(remaining)
-            audit.append("residual_delete_incomplete", approved_target=str(path), failed_path=str(exc.target),
+            audit.append("residual_quarantine_incomplete", approved_target=str(path), failed_path=str(exc.target),
                          stage=exc.stage, operation=exc.operation, winerror=exc.winerror, remaining_path=remaining,
                          restore_error=str(exc.restore_error) if exc.restore_error else None, reason=str(exc))
         except (OSError, ValueError) as exc:
-            audit.append("residual_delete_incomplete", approved_target=str(path), failed_path=str(path), reason=str(exc))
-    return deleted, pending
+            audit.append("residual_quarantine_incomplete", approved_target=str(path), failed_path=str(path), reason=str(exc))
+    return moved, pending
 
 
 def _residual_excerpt(path: Path, identity: tuple[int, int, int, int]) -> str:
@@ -1568,7 +1558,7 @@ class ResidualDiscovery:
                       "required": list(targets), "additionalProperties": False}
         else:
             field, prompt = "confirmed_ids", RESIDUAL_REVIEW_PROMPT
-            output = {"type": "array", "items": {"type": "string", "enum": list(targets)}}
+            output = _id_array(targets)
         schema = {"type": "object", "properties": {field: output}, "required": [field], "additionalProperties": False}
         try:
             answer = self.session.respond("residual_review", prompt, {
@@ -1759,9 +1749,7 @@ class ResidualDiscovery:
             if any(key.startswith("search_") for key in actions):
                 fields.update(query={"type": "string"}, argument={"type": "string"})
             if "propose" in actions:
-                fields["target_ids"] = {"type": "array", "items": {
-                    "type": "string", "enum": [*available_files, *folder_targets],
-                }}
+                fields["target_ids"] = _id_array([*available_files, *folder_targets])
             answer = self.session.ask("residuals", RESIDUAL_PROPOSAL_PROMPT if "propose" in actions else RESIDUAL_PROMPT, {
                 "app_name": self.app_name, "user_request": self.user_request,
                 "verified_app": self._verified_app(),
@@ -1937,22 +1925,25 @@ def _vendor_review_rows(plan: RemovalPlan) -> list[tuple[str, str]]:
     rows = [("Installation record", plan.app.source)]
     if plan.app_root:
         rows.append(("Installation folder", str(plan.app_root)))
-    return [*rows, ("Uninstaller", plan.command[0]), ("Verification", plan.evidence)]
+    rows += [("Uninstaller", plan.command[0]), ("Verification", plan.evidence)]
+    if plan.warning:
+        rows += [("Uninstaller SHA-256", plan.executable_digest), ("Not verified", plan.warning)]
+    return rows
 
 
 def _portable_review_rows(app: PortableApp, skip_archive: bool = False) -> list[tuple[str, str]]:
     package = app.package
     archive = package.archive if package and not skip_archive else None
     if package and package.directories:
-        rows = [("Delete this folder and all its contents", str(package.folder)),
+        rows = [("Move this folder and all its contents", str(package.folder)),
                 ("Files in the folder", str(len(app.files) + bool(archive and is_within(archive.file.path, package.folder))))]
         examples = "\n".join(str(file.path.relative_to(package.folder)) for file in app.files[:8])
         if examples:
             rows.append(("Included files", examples))
     else:
-        rows = [("Permanently delete file", str(file.path)) for file in app.files]
+        rows = [("Move file", str(file.path)) for file in app.files]
     if archive:
-        rows.append(("Permanently delete matching distribution ZIP", str(archive.file.path)))
+        rows.append(("Move matching distribution ZIP", str(archive.file.path)))
     return rows
 
 
@@ -1983,16 +1974,16 @@ def _report_indirect_cleanup(copy: dict, targets: set[PortableFile | PortableDir
 
 
 def _run_portable(
-    app: PortableApp, repo_root: Path, result: dict, finish: Finish, audit: AuditLog, *, apply: bool,
+    app: PortableApp, journal: RecoveryJournal, result: dict, finish: Finish, audit: AuditLog, *, apply: bool,
     closing: Event, review: Review, progress: Progress, session: ToolSession,
-    preapproved: bool | None, deleted_targets: set[PortableFile | PortableDirectory],
+    preapproved: bool | None, removed_targets: set[PortableFile | PortableDirectory],
     already_removed: set[PortableFile | PortableDirectory],
 ) -> dict:
     package = app.package
     folders = tuple(item for item in package.directories if item not in already_removed) if package else ()
     archive = package.archive if package else None
     if archive and archive.file in already_removed:
-        result["previously_deleted_archive"] = str(archive.file.path)
+        result["previously_removed_archive"] = str(archive.file.path)
         archive = None
     files = tuple(sorted((file for file in app.files if file not in already_removed),
                          key=lambda file: file.path != app.executable))
@@ -2001,10 +1992,10 @@ def _run_portable(
         audit.append("portable_targets_already_removed", targets=result["previously_removed_targets"])
     evidence = package.evidence if package else "These are the executable and files proposed by the model."
     result.update(app_name=app.name, app_kind="Unregistered portable", portable_executable=str(app.executable),
-                  portable_files=[str(file.path) for file in app.files], evidence=evidence, portable_deleted_count=0)
+                  portable_files=[str(file.path) for file in app.files], evidence=evidence, portable_quarantined_count=0)
     if folders:
         result["portable_folder"] = str(package.folder)
-        if is_within(repo_root, package.folder):
+        if is_within(journal.repo_root, package.folder):
             return finish("blocked", "The proposed folder contains this UninstallerX instance.")
     if archive:
         result["portable_archive"] = str(archive.file.path)
@@ -2015,17 +2006,17 @@ def _run_portable(
         return finish("preview", evidence)
 
     if preapproved is None and not closing.is_set():
-        preapproved = review(f"Permanently delete {app.name}?", _portable_review_rows(app, skip_archive=archive is None),
-                             f"{evidence} This deletion cannot be undone in UninstallerX.")
+        preapproved = review(f"Move {app.name} to the recovery folder?", _portable_review_rows(app, skip_archive=archive is None),
+                             f"{evidence} Moved items can be restored from this job.")
     if closing.is_set() or not preapproved:
         return finish("declined", "The portable app files stayed in place.")
 
-    def record_delete_failure(path: Path, stage: str, exc: Exception) -> None:
+    def record_move_failure(path: Path, stage: str, exc: Exception) -> None:
         winerror = getattr(exc, "winerror", None)
         operation = getattr(exc, "operation", None)
-        result.update(portable_delete_error=f"{path}: {exc}", portable_delete_stage=stage, portable_delete_winerror=winerror)
+        result.update(portable_quarantine_error=f"{path}: {exc}", portable_quarantine_stage=stage, portable_quarantine_winerror=winerror)
         if operation:
-            result["portable_delete_operation"] = operation
+            result["portable_quarantine_operation"] = operation
         fields = {}
         if isinstance(exc, _FolderCleanupError):
             if exc.remaining:
@@ -2033,7 +2024,7 @@ def _run_portable(
                 result["portable_pending_path"] = fields["remaining_path"]
             if exc.restore_error:
                 fields["restore_error"] = str(exc.restore_error)
-        audit.append("portable_delete_failed", target=str(path), stage=stage, winerror=winerror,
+        audit.append("portable_quarantine_failed", target=str(path), stage=stage, winerror=winerror,
                      operation=operation, reason=str(exc), **fields)
 
     archive_inside = bool(archive and folders and is_within(archive.file.path, package.folder))
@@ -2059,40 +2050,45 @@ def _run_portable(
         try:
             _retry_sharing_conflict(lambda: check_delete_access(file), closing)
         except (OSError, ValueError) as exc:
-            record_delete_failure(file.path, "check_file_access", exc)
-            return finish("blocked", f"The approved file could not be opened for deletion. {exc}")
+            record_move_failure(file.path, "check_file_access", exc)
+            return finish("blocked", f"The approved file could not be opened for the move. {exc}")
     targets = (*files, *folders, *extra)
-    progress(f"Deleting the approved {app.name} files?")
-    audit.append("portable_delete_approved", targets=[str(target.path) for target in targets])
+    progress(f"Moving the approved {app.name} files to the recovery folder…")
+    audit.append("portable_quarantine_approved", targets=[str(target.path) for target in targets])
     removed = 0
 
-    def record_deleted(target: PortableFile | PortableDirectory) -> None:
+    def record_moved(target: PortableFile | PortableDirectory) -> None:
         nonlocal removed
         removed += 1
-        deleted_targets.add(target)
+        removed_targets.add(target)
+        result["recovery_available"] = True
         if not isinstance(target, PortableDirectory):
-            result["portable_deleted_count"] += 1
-        audit.append("portable_deleted", target=str(target.path))
+            result["portable_quarantined_count"] += 1
+        audit.append("portable_quarantined", target=str(target.path))
 
     path = app.executable
     try:
         if folders:
-            _delete_approved_folder(package.folder, files, folders, audit, closing, record_deleted)
+            # A folder that is the search area itself keeps its backup beside it.
+            scope = app.search_root if _in_child(package.folder, app.search_root) else package.folder.parent
+            _quarantine_folder(package.folder, files, folders, scope, journal, audit, closing)
+            for item in (*files, *folders):
+                record_moved(item)
             files = ()
         for file in (*files, *extra):
             path = file.path
-            _retry_sharing_conflict(lambda: delete_verified(file), closing)
-            record_deleted(file)
+            _quarantine_file(file, archive.search_root if file in extra else app.search_root, journal, closing)
+            record_moved(file)
     except _FolderCleanupError as exc:
-        record_delete_failure(exc.target, exc.stage, exc)
-        if not removed and not exc.remaining:
-            return finish("blocked", f"Folder cleanup stopped before any confirmed deletion. {exc}")
+        record_move_failure(exc.target, exc.stage, exc)
+        if not exc.remaining:
+            return finish("blocked", f"The folder stayed in place. {exc}")
     except (OSError, ValueError) as exc:
-        record_delete_failure(path, "delete", exc)
-    if removed == len(targets) and "portable_delete_error" not in result:
-        return finish("removed", f"Permanently deleted {result['portable_deleted_count']} files.")
-    reason = result.get("portable_delete_error", "The operation was stopped.")
-    message = f"Deleted {removed} of {len(targets)} approved items. {reason}"
+        record_move_failure(path, "move", exc)
+    if removed == len(targets) and "portable_quarantine_error" not in result:
+        return finish("removed", f"Moved {result['portable_quarantined_count']} files to the recovery folder.")
+    reason = result.get("portable_quarantine_error", "The operation was stopped.")
+    message = f"Moved {removed} of {len(targets)} approved items to the recovery folder. {reason}"
     if pending := result.get("portable_pending_path"):
         message += f" Remaining items are in {pending}."
     return finish("incomplete_cleanup", message)
@@ -2121,6 +2117,7 @@ def _collect_residuals(
 def _clean_residuals(
     subject: ResidualSubject, result: dict, session: ToolSession, review: Review, progress: Progress,
     user_request: str | None, record_cleanup_removal: Callable[[PortableFile | PortableDirectory], None],
+    journal: RecoveryJournal,
 ) -> None:
     if session.closing.is_set() or result.get("audit_write_errors"):
         return
@@ -2129,10 +2126,10 @@ def _clean_residuals(
         return
     app_name = result["app_name"]
     if not review(
-        f"Permanently delete the proposed leftovers for {app_name}?",
-        [("Permanently delete whole folder and all contents", str(item.path)) if isinstance(item, ResidualFolder)
-         else ("Permanently delete file", str(item.path)) for item in targets],
-        "Each listed folder includes all of its contents. This deletion cannot be undone in UninstallerX.",
+        f"Move the proposed leftovers for {app_name} to the recovery folder?",
+        [("Move whole folder and all contents", str(item.path)) if isinstance(item, ResidualFolder)
+         else ("Move file", str(item.path)) for item in targets],
+        "Each listed folder includes all of its contents. Moved items can be restored from this job.",
     ):
         if not session.closing.is_set():
             result["residual_declined_count"] = len(targets)
@@ -2141,9 +2138,11 @@ def _clean_residuals(
         return
     try:
         session.consume_changes(len(targets))
-        progress(f"Permanently deleting the approved leftovers for {app_name}…")
-        count, pending = delete_residuals(targets, roots, session.audit, session.closing, record_cleanup_removal)
-        result.update(residual_deleted_count=count, residual_skipped_count=len(targets) - count)
+        progress(f"Moving the approved leftovers for {app_name} to the recovery folder…")
+        count, pending = quarantine_residuals(targets, roots, journal, session.audit, session.closing, record_cleanup_removal)
+        result.update(residual_quarantined_count=count, residual_skipped_count=len(targets) - count)
+        if count:
+            result["recovery_available"] = True
         if pending:
             result["residual_pending_paths"] = pending
     except (OSError, ValueError) as exc:
@@ -2153,14 +2152,27 @@ def _clean_residuals(
 def _residual_outcome_notes(result: dict) -> list[str]:
     notes = []
     if skipped := result.get("residual_skipped_count"):
-        notes.append(f"{skipped} approved file or folder targets were not completely deleted. See the audit log for details.")
+        notes.append(f"{skipped} approved file or folder targets were not moved. See the audit log for details.")
     if pending := result.get("residual_pending_paths"):
         notes.append("Remaining items are in " + ", ".join(pending) + ".")
     for key, label in (("cache_investigation_error", "Residual file investigation"),
-                       ("cache_execution_error", "Residual file deletion")):
+                       ("cache_execution_error", "Residual file move")):
         if result.get(key):
             notes.append(f"{label} stopped: {result[key]}")
     return notes
+
+
+def _approved_work_remains(result: dict) -> bool:
+    """Only an approved change that was not carried out makes a cleanup incomplete."""
+    return any(result.get(key) for key in (
+        "residual_skipped_count", "residual_pending_paths", "cache_execution_error",
+        "settings_skipped_count", "settings_execution_error", "audit_write_errors"))
+
+
+def _investigation_incomplete(result: dict) -> bool:
+    """An unfinished search for leftovers is reported beside the removal outcome, not as a failed removal."""
+    return any(result.get(key) for key in (
+        "cache_investigation_error", "cache_scan_limited", "settings_investigation_error", "settings_scan_limited"))
 
 
 def new_removal_audit(repo_root: Path) -> AuditLog:
@@ -2178,7 +2190,7 @@ def run_real(
     job_id = audit.path.stem
     journal = RecoveryJournal(repo_root, job_id)
     result: dict = {"job_id": job_id, "app_name": app_name, "apply": apply, "cache_files": [],
-                    "residual_deleted_count": 0, "audit_path": str(audit.path)}
+                    "residual_quarantined_count": 0, "audit_path": str(audit.path)}
 
     def finish(status: str, message: str) -> dict:
         _audit_outcome(audit, result, "job_finished", status=status)
@@ -2308,7 +2320,7 @@ def run_real(
             progress(f"Processing copy {len(copies) + 1} of {len(proposals)}: {proposal.app.name}")
         copy = {"target": proposal.target, "display_target": proposal.command[0] if proposal.command else proposal.target,
                 "model_candidate_id": proposal.candidate_id, "app_name": proposal.app.name,
-                "cache_files": [], "residual_deleted_count": 0}
+                "cache_files": [], "residual_quarantined_count": 0}
         if proposal.candidate_id in approvals:
             copy["copy_approval"] = "approved" if approvals[proposal.candidate_id] else "declined"
         if closing.is_set():
@@ -2335,7 +2347,7 @@ def run_real(
         if apply and copy["status"] == "removed" and isinstance(proposal.app, (PackageApp, PortableApp)):
             copy["primary_removed"] = True
             if not uninstaller_pending:
-                _clean_residuals(proposal.app, copy, session, ask_user, progress, user_request, cleanup_removals.add)
+                _clean_residuals(proposal.app, copy, session, ask_user, progress, user_request, cleanup_removals.add, journal)
             notes = _residual_outcome_notes(copy)
             if uninstaller_pending:
                 notes.append("A vendor uninstaller may still be running. The leftover investigation was deferred.")
@@ -2347,10 +2359,12 @@ def run_real(
                 notes.append("The leftover investigation or cleanup was stopped.")
             if copy.get("audit_write_errors"):
                 notes.append("An audit write failed during removal or cleanup.")
-            if notes:
+            if _approved_work_remains(copy):
                 copy["status"] = "incomplete_cleanup"
+            if _investigation_incomplete(copy) or uninstaller_pending or closing.is_set():
+                copy["investigation_incomplete"] = True
             copy["message"] = " ".join([copy["message"],
-                                       f"Permanently deleted {copy['residual_deleted_count']} leftover file or folder targets.",
+                                       f"Moved {copy['residual_quarantined_count']} leftover file or folder targets to the recovery folder.",
                                        *notes])
 
     for copy in copies:
@@ -2366,7 +2380,7 @@ def run_real(
     else:
         for field in ("app_data_roots", "cache_files", "residual_folders"):
             result[field] = list(dict.fromkeys(path for copy in copies for path in copy.get(field, [])))
-        result["residual_deleted_count"] = sum(copy["residual_deleted_count"] for copy in copies)
+        result["residual_quarantined_count"] = sum(copy["residual_quarantined_count"] for copy in copies)
         result["cache_scan_limited"] = any(copy.get("cache_scan_limited") for copy in copies)
     result.update(copies=copies, recovery_available=any(copy.get("recovery_available") for copy in copies))
     if uninstaller_pending:
@@ -2378,6 +2392,8 @@ def run_real(
         limitations.append(search_error)
     if unresolved:
         limitations.append(f"{len(unresolved)} observed candidates were left out of the proposal.")
+    if limitations or any(copy.get("investigation_incomplete") for copy in copies):
+        result["investigation_incomplete"] = True
     if not apply:
         if len(copies) == 1 and copies[0]["status"] != "preview":
             return finish(copies[0]["status"], " ".join([copies[0]["message"], *limitations]))
@@ -2396,9 +2412,9 @@ def run_real(
                    f"Leftover investigation or cleanup is incomplete for {verified_with_leftovers}.")
     if uninstaller_pending:
         message += " An uninstaller may still be running. Later copies were left in place."
-    if len(copies) == 1 and not limitations:
+    if len(copies) == 1:
         message = copies[0]["message"]
-    status = "removed" if removed == len(copies) and not limitations else "incomplete_cleanup"
+    status = "removed" if removed == len(copies) else "incomplete_cleanup"
     if not any(copy["status"] in {"removed", "incomplete_cleanup"} for copy in copies):
         states = {copy["status"] for copy in copies}
         if uninstaller_pending:
@@ -2414,7 +2430,7 @@ def run_real(
 
 def _execute_copy(
     proposal: RemovalProposal, result: dict, audit: AuditLog, session: ToolSession, journal: RecoveryJournal,
-    deleted_targets: set[PortableFile | PortableDirectory], *, apply: bool, closing: Event, review: Review, progress: Progress,
+    removed_targets: set[PortableFile | PortableDirectory], *, apply: bool, closing: Event, review: Review, progress: Progress,
     preapproved: bool | None,
     prepared: RemovalPlan | None = None, user_request: str | None = None,
 ) -> dict:
@@ -2433,7 +2449,7 @@ def _execute_copy(
         if isinstance(app, PortableApp):
             targets = _portable_targets(app)
             already_removed = set()
-            for target in targets & deleted_targets if apply else ():
+            for target in targets & removed_targets if apply else ():
                 try:
                     target.path.lstat()
                 except FileNotFoundError:
@@ -2448,13 +2464,13 @@ def _execute_copy(
                          decision="allow" if allowed else "deny", reason="observed_portable_files" if allowed else "file_changed")
             if not allowed:
                 return finish("blocked", "A proposed portable file changed after the model read it.")
-            return _run_portable(app, journal.repo_root, result, finish, audit, apply=apply, closing=closing,
-                                 review=review, progress=progress, session=session, deleted_targets=deleted_targets,
+            return _run_portable(app, journal, result, finish, audit, apply=apply, closing=closing,
+                                 review=review, progress=progress, session=session, removed_targets=removed_targets,
                                  preapproved=preapproved, already_removed=already_removed)
     except (ModelError, OSError, ValueError, subprocess.SubprocessError) as exc:
         return finish("blocked", str(exc))
-    app_kind = "MSI" if app.values.get("WindowsInstaller") == 1 and GUID.fullmatch(app.key) else "Win32"
-    result.update(app_name=app.name, registry_source=app.source, app_kind=app_kind)
+    msi = _is_msi(app)
+    result.update(app_name=app.name, registry_source=app.source, app_kind="MSI" if msi else "Win32")
     audit.append("installation_selected", name=app.name, source=app.source)
     progress(f"Verifying the uninstaller and executable for {app.name}…")
     try:
@@ -2462,10 +2478,16 @@ def _execute_copy(
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         audit.append("gate_decision", phase="discovery", target=proposal.target, decision="deny", reason=str(exc))
         return finish("blocked", str(exc))
-    audit.append("gate_decision", phase="discovery", target=proposal.target, decision="allow", reason=plan.evidence)
+    audit.append("gate_decision", phase="discovery", target=proposal.target,
+                 decision="approval_required" if plan.warning else "allow", reason=plan.warning or plan.evidence)
     command = subprocess.list2cmdline(plan.command)
     result.update(command=command, evidence=plan.evidence, publisher=plan.publisher)
-    audit.append("uninstaller_verified", command=command, executable_digest=plan.executable_digest, evidence=plan.evidence)
+    checked = {"command": command, "executable_digest": plan.executable_digest, "evidence": plan.evidence}
+    if plan.warning:
+        result["verification_warning"] = plan.warning
+        audit.append("uninstaller_identity_unverified", **checked, warning=plan.warning)
+    else:
+        audit.append("uninstaller_verified", **checked)
 
     def settings_proposal() -> list[Setting]:
         try:
@@ -2523,13 +2545,16 @@ def _execute_copy(
         session.changes += len(settings)
         _collect_residuals(plan, result, session, progress, user_request)
         message = "Review the model's removal proposal and its remaining file, folder, and setting candidates."
+        if plan.warning:
+            message += " " + plan.warning
         if result.get("settings_investigation_error"):
             message += " Settings investigation stopped: " + result["settings_investigation_error"]
         if result.get("cache_investigation_error"):
             message += " Residual file investigation stopped: " + result["cache_investigation_error"]
         return finish("preview", message)
-    if preapproved is None and not closing.is_set():
-        preapproved = review(f"Run the uninstaller for {app.name}?", _vendor_review_rows(plan),
+    # A batch approval of copies never covers an uninstaller whose identity is unverified.
+    if (preapproved is None or (preapproved and plan.warning)) and not closing.is_set():
+        preapproved = review(f"Run the {'unverified ' if plan.warning else ''}uninstaller for {app.name}?", _vendor_review_rows(plan),
                              "The vendor uninstaller can change the app and its data. The agent checks for remaining files and settings after it exits.")
     if closing.is_set() or not preapproved:
         return finish("declined", "The uninstaller was not run.")
@@ -2573,20 +2598,19 @@ def _execute_copy(
         }[completed.state]
         return finish("uninstaller_unverified", f"{message} Remaining files were left in place.")
     record_vendor_event("uninstaller_exited", exit_code=exit_code, total_processes=completed.total_processes)
-    vendor_status = VENDOR_EXIT_CODES.get((_label(plan.publisher), _label(plan.product)), {}).get(exit_code)
-    if exit_code in RESTART_EXIT_CODES or vendor_status == "restart":
+    if exit_code in RESTART_EXIT_CODES:
         return finish("restart_required", "The uninstaller requested a restart. Remaining files were left in place.")
-    if vendor_status == "cancelled":
-        return finish("declined", "The vendor uninstaller reported that removal was cancelled.")
-    # Win32 vendors use their own exit codes. Confirm the approved installation's state before cleanup.
+    # Vendors define their own exit codes, so the observed installation state decides the outcome.
+    # Without an identified app executable, the uninstaller's own file marks the installation.
+    program = plan.primary or Path(plan.command[0])
     for _ in range(12):
         try:
             entry_gone = _read_installation(app.hive, app.view, app.key) is None
-            if plan.primary is None:
+            if msi:
                 primary_gone = _msi_state(ctypes.WinDLL("msi.dll"), app.key) == -1  # INSTALLSTATE_UNKNOWN
             else:
                 try:
-                    plan.primary.lstat()
+                    program.lstat()
                 except FileNotFoundError:
                     primary_gone = True
                 else:
@@ -2601,33 +2625,26 @@ def _execute_copy(
     _audit_outcome(audit, result, "uninstaller_verification", registration_removed=entry_gone, primary_removed=primary_gone)
     result.update(registration_removed=entry_gone, primary_removed=primary_gone)
     if not (entry_gone and primary_gone):
-        status = "uninstaller_failed" if exit_code else "uninstaller_unverified"
-        return finish(status, f"The launcher exited with code {exit_code}. The executable or Windows registration was still present at the last check. Remaining files were left in place.")
+        return finish(*unconfirmed_removal(exit_code, registration_removed=entry_gone, program_removed=primary_gone, msi=msi))
     result["uninstaller_verified"] = True
     if result.get("audit_write_errors"):
         return finish("incomplete_cleanup", "Installation removal was confirmed. Remaining targets were left in place after an audit write failed.")
-    if vendor_status == "failed":
-        return finish("incomplete_cleanup", f"The registration and executable are gone, but the vendor reported failure with exit code {exit_code}.")
 
-    _clean_residuals(plan, result, session, review, progress, user_request, deleted_targets.add)
+    _clean_residuals(plan, result, session, review, progress, user_request, removed_targets.add, journal)
     if not closing.is_set() and not result.get("audit_write_errors"):
         try:
             result["settings_removed_count"] = remove_settings(settings_proposal())
         except InvestigationError as exc:
             result["settings_execution_error"] = str(exc)
     count = result.get("settings_removed_count", 0)
-    result["recovery_available"] = count > 0
-    message = f"Removal confirmed. Permanently deleted {result['residual_deleted_count']} leftover file or folder targets and backed up and removed {count} settings."
-    if exit_code:
-        message += f" The uninstaller returned exit code {exit_code}."
+    result["recovery_available"] = count > 0 or result["residual_quarantined_count"] > 0
+    message = f"Removal confirmed. Moved {result['residual_quarantined_count']} leftover file or folder targets to the recovery folder and backed up and removed {count} settings."
     residual_notes = _residual_outcome_notes(result)
     if residual_notes:
         message += " " + " ".join(residual_notes)
-    errors = bool(residual_notes)
     for key, label in (("settings_investigation_error", "Settings investigation"),
                        ("settings_execution_error", "Settings changes")):
         if result.get(key):
-            errors = True
             message += f" {label} stopped: {result[key]}"
     inspection_incomplete = result.get("cache_scan_limited") or result.get("settings_scan_limited")
     if inspection_incomplete:
@@ -2639,5 +2656,6 @@ def _execute_copy(
     declined = result.get("residual_declined_count", 0) + result.get("settings_declined_count", 0)
     if declined:
         message += f" You chose to leave {declined} proposed targets in place."
-    incomplete = errors or inspection_incomplete or settings_skipped or declined or closing.is_set()
-    return finish("incomplete_cleanup" if incomplete else "removed", message)
+    if _investigation_incomplete(result) or closing.is_set():
+        result["investigation_incomplete"] = True
+    return finish("incomplete_cleanup" if _approved_work_remains(result) else "removed", message)
